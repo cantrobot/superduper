@@ -1,0 +1,257 @@
+#!/bin/bash
+
+source /etc/superduper/settings
+
+[ -d /var/run/superduper ] || mkdir -p /var/run/superduper
+[ -d /var/log/superduper ] || mkdir -p /var/log/superduper
+
+function _usage() {
+  echo -e "usage: $0 command [args]\n"
+  echo "Commands:"
+  echo "  list                    - List webservers and namespaces"
+  echo "  create [name]           - Creates a webserver in a new namespace"
+  echo "  delete [name]           - Completele deletes the nameserver/networking/namespace"
+  echo "  move [name] [prod|test] - Move instance from one HAProxy backend to another (prod|test)"
+  echo "  start                   - Start all services"
+  echo "  stop                    - Stop all services"
+  echo "  status                  - Show status of all services"
+  echo "  start_proxy             - Start flow proxy"
+  echo "  stop_proxy              - Stop flow proxy"
+  echo "  start_consul            - Start consul agent"
+  echo "  stop_consul             - Stop consul agent"
+  echo "  start_confd             - Start confd"
+  echo "  stop_confd              - Stop confd"
+  exit 1
+}
+
+function _exit() {
+  local msg=$1
+  echo $msg
+  exit 1
+}
+
+function _kill_pid() {
+  local pid=$1
+  local i=0
+  [ -z $pid ] && _exit "No process running"
+  echo "Trying to kill pid ${pid}..."
+  while ps -p $pid &> /dev/null && [ $i -lt 10 ]; do
+    kill $pid
+    sleep 2
+    let i=$((i+1))
+  done
+  [ $i == 10 ] && _exit "Could not kill process, giving up"
+}
+
+function _get_ip() {
+  local ns=$1
+  local ip=$(ip netns exec $ns ip addr show tap-$ns \
+    | grep "inet " | awk '{ print $2 }' | cut -d'/' -f1)
+  echo $ip
+}
+
+function _get_next_ip() {
+  local ip=''
+  local i=3
+  local network=$(echo $NETWORK | cut -d'.' -f1-3)
+  while [ -z $ip ] && [ $i -lt 255 ]; do
+    if ! ping -q -c 1 ${network}.${i} &> /dev/null; then
+      ip="${network}.${i}"
+    else
+      let i=$((i+1))
+    fi
+  done
+  [ -z $ip ] && _exit "No valid IP found in network ${NETWORK}"
+  echo $ip
+}
+
+function _clean_namespace() {
+  local ns=$1
+  if [ -f /var/run/superduper/${ns}-server.pid ]; then
+    kill -9 $(cat /var/run/superduper/${ns}-server.pid)
+    rm /var/run/superduper/${ns}-server.pid
+  fi
+  ip netns del $ns &> /dev/null
+  ip link delete tap-${ns} &> /dev/null
+  ip link delete br-${ns} &> /dev/null
+}
+
+function _add_ns() {
+  local ns=$1
+  if ip netns | egrep -q "^${ns}$"; then
+    _exit "Namespace '${ns}' already exists"
+  else
+    ip netns add $ns
+    echo "Added namespace ${ns}"
+  fi
+}
+
+function _add_bridge() {
+  local ip=$(_get_next_ip)
+  local cidr=$(echo $NETWORK | cut -d'/' -f2)
+  brctl addbr $BRIDGE
+  brctl stp $BRIDGE off
+  ip link set dev $BRIDGE up
+  ip addr add ${ip}/${cidr} dev $BRIDGE
+  curl -s -X PUT -d $ip http://localhost:8500/v1/kv/web/bridge &> /dev/null
+  echo "Created bridge ${BRIDGE} with IP ${ip}/${cidr}"
+}
+
+function _add_veth_pair() {
+  local name=$1
+  local ip=$2
+  local cidr=$(echo $NETWORK | cut -d'/' -f2)
+  brctl show $BRIDGE 2>&1 | grep -q 'No such device' && _add_bridge
+  if ip link list | grep -q br-${name}; then
+    _exit "veth pair already exists"
+  else
+    ip link add tap-${name} type veth peer name br-${name}
+    brctl addif $BRIDGE br-${name}
+    ip link set tap-${name} netns $name
+    ip netns exec $name ip link set dev tap-${name} up
+    ip netns exec $name ip addr add ${ip}/${cidr} dev tap-${name}
+    ip link set dev br-${name} up
+    echo "Created veth pair in ns ${name} with IP ${ip}/${cidr}"
+  fi
+}
+
+function _add_backend() {
+  local name=$1
+  local ip=$2
+  local backend=${3:-prod}
+  local result=$(curl -s -X PUT -d $ip \
+    http://localhost:8500/v1/kv/web/${backend}/backend/${name})
+  [[ $result == 'true' ]] || _exit "Could not update consul"
+  echo "Created /web/${backend}/backend/${name} with IP ${ip}"
+}
+
+function _remove_backend() {
+  local name=$1
+  curl -s -X DELETE http://localhost:8500/v1/kv/web/prod/backend/${name} &> /dev/null
+  curl -s -X DELETE http://localhost:8500/v1/kv/web/test/backend/${name} &> /dev/null
+}
+
+function _create() {
+  local name=$1
+  local ip=$(_get_next_ip)
+  _add_ns $name
+  _add_veth_pair $name $ip
+  ip netns exec $name \
+    nohup python -m SimpleHTTPServer 8000 \
+    > /var/log/superduper/${name}-server.log 2>&1 > /dev/null & \
+    echo $! > /var/run/superduper/${name}-server.pid
+  echo "Created web server in namespace '${name}'"
+  _add_backend $name $ip
+}
+
+function _delete() {
+  local name=$1
+  _clean_namespace $name
+  _remove_backend $name
+}
+
+function _move() {
+  local name=$1
+  local backend=${3:-test}
+  local ip=$(_get_ip $name)
+  _remove_backend $name
+  _add_backend $name $ip $backend
+}
+
+function _status() {
+  echo "Namespace Instances"
+  for ns in $(ip netns); do
+    ip=$(_get_ip $ns)
+    pid=$(ip netns exec $ns netstat -lntp | \
+      grep 8000 | awk '{ print $4,$7 }')
+    echo "  ${ns} ${ip} [${pid}]"
+  done
+  echo "Services"
+  for s in consul confd proxy; do
+    if [ -f /var/run/superduper/${s}.pid ]; then
+      [ -d "/proc/$(cat /var/run/superduper/${s}.pid)" ] \
+        && echo "  ${s} is running" || echo "  ${s} is stopped"
+    else
+      echo "  ${s} is stopped"
+    fi
+  done
+}
+
+function _start_proxy() {
+  echo "Starting proxy"
+  local ip=$(ip addr show $BRIDGE | grep "inet " \
+    | awk '{ print $2 }' | cut -d'/' -f1)
+  nohup mitmdump -s /etc/superduper/replay_and_test.py \
+    -b $ip -p 80 -P http://${ip}:8000 \
+    > /var/log/superduper/proxy.log 2> /dev/null & \
+    echo $! > /var/run/superduper/proxy.pid
+}
+
+function _stop_proxy() {
+  echo "Stopping proxy"
+  [ -f /var/run/superduper/proxy.pid ] && _kill_pid $(cat /var/run/superduper/proxy.pid)
+}
+
+function _start_consul() {
+  echo "Starting consul"
+  nohup consul agent -server -bootstrap-expect 1 -config-dir /etc/consul.d \
+    -data-dir /var/lib/consul -pid-file /var/run/superduper/consul.pid \
+    > /var/log/superduper/consul.log 2>&1 > /dev/null &
+}
+
+function _stop_consul() {
+  echo "Stopping consul"
+  [ -f /var/run/superduper/consul.pid ] && _kill_pid $(cat /var/run/superduper/consul.pid)
+}
+
+function _start_confd() {
+  echo "Starting confd"
+  nohup confd -backend consul -node 127.0.0.1:8500 -interval 15 \
+    &> /var/log/superduper/confd.log 2>&1 > /dev/null & \
+    echo $! > /var/run/superduper/confd.pid
+}
+
+function _stop_confd() {
+  echo "Stopping confd"
+  [ -f /var/run/superduper/confd.pid ] && _kill_pid $(cat /var/run/superduper/confd.pid)
+}
+
+[[ $USER == 'root' ]] || _exit "Must run script as root user"
+
+while ! [ -z $1 ]; do
+  case $1 in
+    'list')         ACTION='list';;
+    'create')       ACTION='create'; shift; ARG=$1;;
+    'delete')       ACTION='delete'; shift; ARG=$1;;
+    'move')         ACTION='move'; shift; ARG=$1; shift; BACKEND=$1;;
+    'start')        ACTION='start';;
+    'stop')         ACTION='stop';;
+    'status')       ACTION='status';;
+    'start_proxy')  ACTION='start_proxy';;
+    'stop_proxy')   ACTION='stop_proxy';;
+    'start_consul') ACTION='start_consul';;
+    'stop_consul')  ACTION='stop_consul';;
+    'start_confd')  ACTION='start_confd';;
+    'stop_confd')   ACTION='stop_confd';;
+    *)              _usage;;
+  esac
+  shift
+done
+
+case $ACTION in
+  'list')         ip netns;;
+  'create')       [ -z $ARG ] && _usage || _create $ARG;;
+  'delete')       [ -z $ARG ] && _usage || _delete $ARG;;
+  'move')         [ -z $ARG -o -z "$BACKEND" ] && _usage \
+                    || _move $ARG $BACKEND;;
+  'start')        _start_proxy; _start_consul; _start_confd;;
+  'stop')         _stop_proxy; _stop_consul; _stop_confd;;
+  'status')       _status;;
+  'start_proxy')  _start_proxy;;
+  'stop_proxy')   _stop_proxy;;
+  'start_consul') _start_consul;;
+  'stop_consul')  _stop_consul;;
+  'start_confd')  _start_confd;;
+  'stop_confd')   _stop_confd;;
+  *)              _usage;;
+esac

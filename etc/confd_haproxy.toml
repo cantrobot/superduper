@@ -1,0 +1,13 @@
+[template]
+prefix = "/web"
+src = "haproxy.tmpl"
+dest = "/etc/haproxy/haproxy.cfg"
+owner = "root"
+mode = "0644"
+keys = [
+  "/bridge",
+  "/prod",
+  "/test"
+]
+check_cmd = "/usr/sbin/haproxy -c -f {{.src}}"
+reload_cmd = "/usr/sbin/service haproxy reload"

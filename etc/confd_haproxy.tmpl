@@ -1,0 +1,27 @@
+defaults
+    log     global
+    mode    http
+    option  httplog
+    option  dontlognull
+    retries 3
+    option redispatch
+    timeout connect  5000
+    timeout client  10000
+    timeout server  10000
+
+listen prod {{getv "/bridge"}}:8000
+    mode http
+    balance roundrobin
+    option httpclose
+    option forwardfor
+    {{range gets "/prod/backend/*"}}server {{base .Key}} {{.Value}}:8000 check
+    {{end}}
+
+listen prod {{getv "/bridge"}}:8001
+    mode http
+    balance roundrobin
+    option httpclose
+    option forwardfor
+    cookie host_id insert
+    {{range gets "/test/backend/*"}}server {{base .Key}} {{.Value}}:8000 cookie {{base .Key}} check
+    {{end}}
